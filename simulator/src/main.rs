@@ -39,6 +39,7 @@ fn main() {
                 error: Some(format!("Invalid JSON: {}", e)),
                 events: vec![],
                 logs: vec![],
+                flamegraph: None,
             };
             println!("{}", serde_json::to_string(&res).unwrap());
             return;
