@@ -1,4 +1,4 @@
-.PHONY: build test lint lint-unused test-unused clean
+.PHONY: build test lint lint-unused test-unused validate-ci clean
 
 # Build the main binary
 build:
@@ -19,6 +19,10 @@ lint-unused:
 # Test unused code detection setup
 test-unused:
 	./scripts/test-unused-detection.sh
+
+# Validate CI/CD configuration
+validate-ci:
+	./scripts/validate-ci.sh
 
 # Clean build artifacts
 clean:
