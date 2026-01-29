@@ -9,6 +9,8 @@ mod gas_optimizer;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use soroban_env_host::events::Events;
 use soroban_env_host::xdr::ReadXdr;
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -20,8 +22,9 @@ use gas_optimizer::{BudgetMetrics, GasOptimizationAdvisor, OptimizationReport};
 struct SimulationRequest {
     envelope_xdr: String,
     result_meta_xdr: String,
-    // Key XDR -> Entry XDR
     ledger_entries: Option<HashMap<String, String>>,
+    timestamp: Option<i64>,
+    ledger_sequence: Option<u32>,
     // Optional: Path to local WASM file for local replay
     wasm_path: Option<String>,
     // Optional: Mock arguments for local replay (JSON array of strings)
@@ -31,11 +34,20 @@ struct SimulationRequest {
     enable_optimization_advisor: bool,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct CategorizedEvent {
+    event_type: String,
+    contract_id: Option<String>,
+    topics: Vec<String>,
+    data: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SimulationResponse {
     status: String,
     error: Option<String>,
     events: Vec<String>,
+    categorized_events: Vec<CategorizedEvent>,
     logs: Vec<String>,
     flamegraph: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,6 +61,90 @@ struct BudgetUsage {
     cpu_instructions: u64,
     memory_bytes: u64,
     operations_count: usize,
+}
+
+fn categorize_event_for_analyzer(
+    event: &soroban_env_host::events::HostEvent,
+) -> Result<String, String> {
+    use soroban_env_host::xdr::{ContractEventBody, ContractEventType, ScVal};
+
+    let contract_id = match &event.event.contract_id {
+        Some(id) => format!("{:?}", id),
+        None => "unknown".to_string(),
+    };
+
+    let event_type_str = match &event.event.type_ {
+        ContractEventType::Contract => "contract",
+        ContractEventType::System => "system",
+        ContractEventType::Diagnostic => "diagnostic",
+    };
+
+    let (topics, _data_val) = match &event.event.body {
+        ContractEventBody::V0(v0) => (&v0.topics, &v0.data),
+    };
+
+    let event_json = if let Some(first_topic) = topics.get(0) {
+        let topic_str = format!("{:?}", first_topic);
+
+        if topic_str.contains("require_auth") {
+            let address = if let ScVal::Address(addr) = first_topic {
+                format!("{:?}", addr)
+            } else {
+                "unknown".to_string()
+            };
+
+            json!({
+                "type": "auth",
+                "contract": contract_id,
+                "address": address,
+                "event_type": event_type_str,
+            })
+            .to_string()
+        } else if topic_str.contains("set")
+            || topic_str.contains("write")
+            || topic_str.contains("storage")
+        {
+            json!({
+                "type": "storage_write",
+                "contract": contract_id,
+                "event_type": event_type_str,
+            })
+            .to_string()
+        } else if topic_str.contains("call") || topic_str.contains("invoke") {
+            if let ScVal::Symbol(sym) = first_topic {
+                json!({
+                    "type": "contract_call",
+                    "contract": contract_id,
+                    "function": sym.to_string(),
+                    "event_type": event_type_str,
+                })
+                .to_string()
+            } else {
+                json!({
+                    "type": "contract_call",
+                    "contract": contract_id,
+                    "event_type": event_type_str,
+                })
+                .to_string()
+            }
+        } else {
+            json!({
+                "type": "other",
+                "contract": contract_id,
+                "event_type": event_type_str,
+            })
+            .to_string()
+        }
+    } else {
+        json!({
+            "type": "other",
+            "contract": contract_id,
+            "event_type": event_type_str,
+        })
+        .to_string()
+    };
+
+    Ok(event_json)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +162,7 @@ fn main() {
             status: "error".to_string(),
             error: Some(format!("Failed to read stdin: {}", e)),
             events: vec![],
+            categorized_events: vec![],
             logs: vec![],
             flamegraph: None,
             optimization_report: None,
@@ -83,6 +180,7 @@ fn main() {
                 status: "error".to_string(),
                 error: Some(format!("Invalid JSON: {}", e)),
                 events: vec![],
+                categorized_events: vec![],
                 logs: vec![],
                 flamegraph: None,
                 optimization_report: None,
@@ -119,6 +217,18 @@ fn main() {
     host.set_diagnostic_level(soroban_env_host::DiagnosticLevel::Debug)
         .unwrap();
 
+    // Override Ledger Info if provided
+    if request.timestamp.is_some() || request.ledger_sequence.is_some() {
+        host.with_mut_ledger_info(|ledger_info| {
+            if let Some(ts) = request.timestamp {
+                ledger_info.timestamp = ts as u64;
+            }
+            if let Some(seq) = request.ledger_sequence {
+                ledger_info.sequence_number = seq;
+            }
+        })
+        .unwrap();
+    }
     // Populate Host Storage
     let mut loaded_entries_count = 0;
     if let Some(entries) = &request.ledger_entries {
@@ -205,10 +315,16 @@ fn main() {
     }
 
     match result {
-        Ok(exec_logs) => {
+        Ok(Ok(exec_logs)) => {
             let events = match host.get_events() {
                 Ok(evs) => evs.0.iter().map(|e| format!("{:?}", e)).collect(),
                 Err(_) => vec!["Failed to retrieve events".to_string()],
+            };
+
+            // Capture categorized events for analyzer
+            let categorized_events = match host.get_events() {
+                Ok(evs) => categorize_events(&evs),
+                Err(_) => vec![],
             };
 
             let mut final_logs = vec![
@@ -221,11 +337,37 @@ fn main() {
                 status: "success".to_string(),
                 error: None,
                 events,
+                categorized_events,
                 logs: final_logs,
                 flamegraph: flamegraph_svg,
                 optimization_report,
                 budget_usage: Some(budget_usage),
             };
+
+            println!("{}", serde_json::to_string(&response).unwrap());
+        }
+        Ok(Err(host_error)) => {
+            // Host error during execution (e.g., contract trap, validation failure)
+            let structured_error = StructuredError {
+                error_type: "HostError".to_string(),
+                message: format!("{:?}", host_error),
+                details: Some(format!(
+                    "Contract execution failed with host error: {:?}",
+                    host_error
+                )),
+            };
+
+            let response = SimulationResponse {
+                status: "error".to_string(),
+                error: Some(serde_json::to_string(&structured_error).unwrap()),
+                events: vec![],
+                categorized_events: vec![],
+                logs: vec![],
+                flamegraph: None,
+                optimization_report: None,
+                budget_usage: None,
+            };
+
             println!("{}", serde_json::to_string(&response).unwrap());
         }
         Err(panic_info) => {
@@ -241,6 +383,7 @@ fn main() {
                 status: "error".to_string(),
                 error: Some(format!("Simulator panicked: {}", panic_msg)),
                 events: vec![],
+                categorized_events: vec![],
                 logs: vec![format!("PANIC: {}", panic_msg)],
                 flamegraph: None,
                 optimization_report: None,
@@ -254,13 +397,96 @@ fn main() {
 fn execute_operations(
     _host: &soroban_env_host::Host,
     operations: &soroban_env_host::xdr::VecM<soroban_env_host::xdr::Operation, 100>,
-) -> Vec<String> {
+) -> Result<Vec<String>, soroban_env_host::HostError> {
     let mut logs = vec![];
-    for (i, op) in operations.as_slice().iter().enumerate() {
-        logs.push(format!("Processing operation {}: {:?}", i, op.body));
-        // Placeholder for real host invocation
+
+    for op in operations.iter() {
+        if let soroban_env_host::xdr::OperationBody::InvokeHostFunction(host_fn_op) = &op.body {
+            match &host_fn_op.host_function {
+                soroban_env_host::xdr::HostFunction::InvokeContract(invoke_args) => {
+                    logs.push("Found InvokeContract operation!".to_string());
+
+                    let address = &invoke_args.contract_address;
+                    let func_name = &invoke_args.function_name;
+                    let invoke_args_vec = &invoke_args.args;
+
+                    logs.push(format!("About to Invoke Contract: {:?}", address));
+                    logs.push(format!("Function: {:?}", func_name));
+                    logs.push(format!("Args Count: {}", invoke_args_vec.len()));
+                }
+                _ => {
+                    logs.push("Skipping non-InvokeContract Host Function".to_string());
+                }
+            }
+        }
     }
-    logs
+    Ok(logs)
+}
+
+fn categorize_events(events: &Events) -> Vec<CategorizedEvent> {
+    use soroban_env_host::xdr::{ContractEventBody, ContractEventType, ScVal};
+
+    events
+        .0
+        .iter()
+        .filter_map(|event| {
+            // Access body to get topics and data
+            let (topics, data_val) = match &event.event.body {
+                ContractEventBody::V0(v0) => (&v0.topics, &v0.data),
+            };
+
+            if !event.failed_call {
+                let event_type = match &event.event.type_ {
+                    ContractEventType::Contract => {
+                        if let Some(topic) = topics.get(0) {
+                            if let ScVal::Symbol(sym) = topic {
+                                match sym.to_string().as_str() {
+                                    s if s.contains("require_auth") => "require_auth",
+                                    s if s.contains("set") || s.contains("write") => {
+                                        "storage_write"
+                                    }
+                                    _ => "contract",
+                                }
+                            } else {
+                                "contract"
+                            }
+                        } else {
+                            "contract"
+                        }
+                    }
+                    ContractEventType::System => "system",
+                    ContractEventType::Diagnostic => {
+                        if let Some(topic) = topics.get(0) {
+                            if let ScVal::Symbol(sym) = topic {
+                                match sym.to_string().as_str() {
+                                    s if s.contains("fn_call") => "invocation",
+                                    s if s.contains("fn_return") => "return",
+                                    _ => "diagnostic",
+                                }
+                            } else {
+                                "diagnostic"
+                            }
+                        } else {
+                            "diagnostic"
+                        }
+                    }
+                };
+
+                Some(CategorizedEvent {
+                    event_type: event_type.to_string(),
+                    contract_id: event
+                        .event
+                        .contract_id
+                        .as_ref()
+                        .map(|id| format!("{:?}", id)),
+                    topics: topics.iter().map(|t| format!("{:?}", t)).collect(),
+                    data: format!("{:?}", data_val),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn send_error(msg: String) {
@@ -268,6 +494,7 @@ fn send_error(msg: String) {
         status: "error".to_string(),
         error: Some(msg),
         events: vec![],
+        categorized_events: vec![],
         logs: vec![],
         flamegraph: None,
         optimization_report: None,
@@ -276,9 +503,26 @@ fn send_error(msg: String) {
     println!("{}", serde_json::to_string(&res).unwrap());
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_time_travel_deserialization() {
+        let json = r#"{"envelope_xdr": "AAAA", "result_meta_xdr": "BBBB", "timestamp": 1738077842, "ledger_sequence": 1234}"#;
+        let req: SimulationRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.timestamp, Some(1738077842));
+        assert_eq!(req.ledger_sequence, Some(1234));
+    }
+}
+
 fn run_local_wasm_replay(wasm_path: &str, mock_args: &Option<Vec<String>>) {
     use std::fs;
-    
+    use soroban_env_host::{
+        xdr::{ScVal, ScSymbol, ScAddress},
+        Host,
+    };
+
     eprintln!("🔧 Local WASM Replay Mode");
     eprintln!("WASM Path: {}", wasm_path);
     eprintln!("⚠️  WARNING: Using Mock State (not mainnet data)");
@@ -295,49 +539,42 @@ fn run_local_wasm_replay(wasm_path: &str, mock_args: &Option<Vec<String>>) {
         }
     };
 
-    // Initialize Host with mock state
-    let host = soroban_env_host::Host::default();
+    // Initialize Host
+    let host = Host::default();
     host.set_diagnostic_level(soroban_env_host::DiagnosticLevel::Debug).unwrap();
     
     eprintln!("✓ Initialized Host with diagnostic level: Debug");
 
-    // TODO: In a full implementation, we would:
-    // 1. Parse the WASM module to extract contract metadata
-    // 2. Deploy the contract to the host
-    // 3. Parse mock_args into proper ScVal types
-    // 4. Invoke the contract function with the arguments
-    // 5. Capture and return the result
+    // TODO: Full execution requires 'testutils' feature which is currently causing build issues.
+    // For now, we just parse args and print what we WOULD do.
     
-    // For now, we'll create a basic response showing the setup worked
-    let mut logs = vec![
-        format!("Host Initialized with Budget: {:?}", host.budget_cloned()),
-        format!("WASM file loaded: {} bytes", wasm_bytes.len()),
-        "Mock State Provider: Active".to_string(),
-    ];
+    eprintln!("⚠️  Full execution temporarily disabled due to build issues with 'testutils' feature.");
+    eprintln!("   (See issue #183 for details)");
 
+    // Parse Arguments (Mock)
     if let Some(args) = mock_args {
-        logs.push(format!("Mock Arguments provided: {} args", args.len()));
-        for (i, arg) in args.iter().enumerate() {
-            logs.push(format!("  Arg[{}]: {}", i, arg));
+        if !args.is_empty() {
+             eprintln!("▶ Would invoke function: {}", args[0]);
+             eprintln!("  With args: {:?}", &args[1..]);
         }
-    } else {
-        logs.push("No mock arguments provided".to_string());
     }
 
-    logs.push("".to_string());
-    logs.push("⚠️  Note: Full WASM execution not yet implemented".to_string());
-    logs.push("This is a mock response showing the local replay infrastructure is working.".to_string());
-
-    // Capture diagnostic events
+    // Capture Logs/Events
     let events = match host.get_events() {
         Ok(evs) => evs.0.iter().map(|e| format!("{:?}", e)).collect::<Vec<String>>(),
         Err(e) => vec![format!("Failed to retrieve events: {:?}", e)],
     };
 
+    let logs = vec![
+        format!("Host Budget: {:?}", host.budget_cloned()),
+        "Execution: Skipped (Build Issue)".to_string(),
+    ];
+
     let response = SimulationResponse {
         status: "success".to_string(),
         error: None,
         events,
+        categorized_events: vec![],
         logs,
         flamegraph: None,
         optimization_report: None,
