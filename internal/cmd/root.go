@@ -65,15 +65,3 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 }
 
-// currentSession stores the active debugging session
-var currentSession interface{}
-
-// SetCurrentSession stores the current session data
-func SetCurrentSession(session interface{}) {
-	currentSession = session
-}
-
-// GetCurrentSession retrieves the current session data
-func GetCurrentSession() interface{} {
-	return currentSession
-}
