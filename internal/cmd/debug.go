@@ -24,6 +24,7 @@ import (
 var (
 	networkFlag     string
 	rpcURLFlag      string
+	rpcTokenFlag    string
 	tracingEnabled  bool
 	otlpExporterURL string
 	generateTrace   bool
@@ -82,6 +83,7 @@ Example:
 	// Set up flags
 	cmd.Flags().StringVarP(&networkFlag, "network", "n", string(rpc.Mainnet), "Stellar network to use (testnet, mainnet, futurenet)")
 	cmd.Flags().StringVar(&rpcURLFlag, "rpc-url", "", "Custom Horizon RPC URL to use")
+	cmd.Flags().StringVar(&rpcTokenFlag, "rpc-token", "", "RPC authentication token (can also use ERST_RPC_TOKEN env var)")
 	
 	return cmd
 }
@@ -91,9 +93,9 @@ func (d *DebugCommand) runDebug(cmd *cobra.Command, args []string) error {
 
 	var client *rpc.Client
 	if rpcURLFlag != "" {
-		client = rpc.NewClientWithURL(rpcURLFlag, rpc.Network(networkFlag))
+		client = rpc.NewClientWithURL(rpcURLFlag, rpc.Network(networkFlag), rpcTokenFlag)
 	} else {
-		client = rpc.NewClient(rpc.Network(networkFlag))
+		client = rpc.NewClient(rpc.Network(networkFlag), rpcTokenFlag)
 	}
 
 	fmt.Printf("Debugging transaction: %s\n", txHash)
@@ -205,10 +207,10 @@ The simulation results are stored in a session that can be saved for later analy
 		var client *rpc.Client
 		var horizonURL string
 		if rpcURLFlag != "" {
-			client = rpc.NewClientWithURL(rpcURLFlag, rpc.Network(networkFlag))
+			client = rpc.NewClientWithURL(rpcURLFlag, rpc.Network(networkFlag), rpcTokenFlag)
 			horizonURL = rpcURLFlag
 		} else {
-			client = rpc.NewClient(rpc.Network(networkFlag))
+			client = rpc.NewClient(rpc.Network(networkFlag), rpcTokenFlag)
 			// Get default Horizon URL for the network
 			switch rpc.Network(networkFlag) {
 			case rpc.Testnet:
@@ -362,7 +364,7 @@ The simulation results are stored in a session that can be saved for later analy
 			go func() {
 				defer wg.Done()
 				
-				compareClient := rpc.NewClient(rpc.Network(compareNetworkFlag))
+				compareClient := rpc.NewClient(rpc.Network(compareNetworkFlag), "")
 				
 				// Fetch entries
 				compareEntries, err := compareClient.GetLedgerEntries(cmd.Context(), keys)
@@ -676,6 +678,7 @@ func getErstVersion() string {
 func init() {
 	debugCmd.Flags().StringVarP(&networkFlag, "network", "n", string(rpc.Mainnet), "Stellar network to use (testnet, mainnet, futurenet)")
 	debugCmd.Flags().StringVar(&rpcURLFlag, "rpc-url", "", "Custom Horizon RPC URL to use")
+	debugCmd.Flags().StringVar(&rpcTokenFlag, "rpc-token", "", "RPC authentication token (can also use ERST_RPC_TOKEN env var)")
 	debugCmd.Flags().BoolVar(&tracingEnabled, "tracing", false, "Enable OpenTelemetry tracing")
 	debugCmd.Flags().StringVar(&otlpExporterURL, "otlp-url", "http://localhost:4318", "OTLP exporter URL")
 	debugCmd.Flags().BoolVar(&generateTrace, "generate-trace", false, "Generate execution trace file")
