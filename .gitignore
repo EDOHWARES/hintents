@@ -1,9 +1,26 @@
-docs/proposal2.md
+# Binaries
 /erst
-simulator/target/
+/simulator/target/
+node_modules/
+
+# OS/System
 .DS_Store
 .env
 .env.example
 .cursorrules
 
+# Logs and Temps
+*.log
+*.txt
+simulator/check_output.txt
+
+# Artifacts/Tools
 ishus.py
+.gemini/
+
+# Docs (User preference)
+# /external/
+# /*.md
+# !README.md
+# !CONTRIBUTING.md
+# !CHANGELOG.md
